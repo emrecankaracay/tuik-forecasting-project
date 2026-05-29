@@ -1,0 +1,922 @@
+---
+title: "R-Based Forecasting of Türkiye’s Monthly Export Volume Index Using TÜİK Data"
+author: "Emrecan Karaçay"
+date: "2026-05-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. Project Overview
+
+This project forecasts Türkiye’s monthly Export Volume Index using data obtained from the TÜİK Data Portal. The selected series is the general export volume index from the Monthly Volume Indices by Standard International Trade Classification table.
+
+The purpose of the project is to apply alternative quantitative forecasting methods, compare their forecast accuracy, select the most suitable method, and forecast the next available monthly period.
+
+# 2. Data Source and TÜİK Connection
+
+The selected data set was obtained from the TÜİK Data Portal. The relevant TÜİK table was identified in R using the `tuikr` package. Since direct access through `statistical_data()` returned an authorization error, the table URL obtained from `tuikr::statistical_tables()` was accessed programmatically in R using `httr::GET()`.
+
+No manually downloaded, manually edited, copy-pasted, or externally prepared data file was used.
+
+**TÜİK data set name:** Monthly Volume Indices by Standard International Trade Classification  
+**TÜİK theme/category:** International Trade  
+**TÜİK table name:** Monthly Volume Indices by Standart International Trade Classification  
+**Selected variable:** Export Volume Index — General  
+**Data frequency:** Monthly  
+**Base year:** 2015=100  
+
+# 3. Package Setup
+
+```{r packages}
+library(tuikr)
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(zoo)
+library(httr)
+library(readxl)
+library(rvest)
+library(janitor)
+library(ggplot2)
+library(scales)
+
+dir.create("outputs", showWarnings = FALSE)
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+# 4. Data Access Process
+
+```{r data-access}
+# Access TÜİK International Trade tables
+tables <- statistical_tables("17")
+
+# Select monthly volume indices tables
+volume_istab_tables <- tables %>%
+  filter(
+    node_type == "istab",
+    grepl("Monthly Volume Indices", table_name, ignore.case = TRUE)
+  )
+
+volume_istab_tables %>%
+  select(table_name, node_type, dataflow_id, table_url)
+```
+
+```{r retrieve-data}
+# Select the first matching table URL
+selected_url_1 <- volume_istab_tables$table_url[1]
+
+# Retrieve TÜİK data programmatically in R
+response_1 <- httr::GET(
+  selected_url_1,
+  httr::add_headers(
+    "User-Agent" = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+    "Accept" = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/octet-stream,text/html,application/json,text/plain,*/*",
+    "Accept-Language" = "en-US,en;q=0.9,tr;q=0.8",
+    "Referer" = "https://veriportali.tuik.gov.tr/",
+    "Origin" = "https://veriportali.tuik.gov.tr",
+    "Connection" = "keep-alive"
+  )
+)
+
+# Check connection status
+httr::status_code(response_1)
+
+# Read the Excel content returned by TÜİK
+temp_file_1 <- tempfile(fileext = ".xls")
+writeBin(httr::content(response_1, "raw"), temp_file_1)
+
+raw_data_1 <- readxl::read_excel(temp_file_1)
+
+head(raw_data_1)
+```
+
+# 5. Data Preparation
+
+The raw TÜİK table contains title rows and hierarchical column labels. The selected series is the general export volume index under the “İhracat-Exports” category. The year column is filled downward because the original TÜİK table reports the year once and leaves the following monthly rows blank.
+
+```{r data-cleaning}
+export_general <- raw_data_1 %>%
+  slice(5:n()) %>%
+  select(
+    year = 1,
+    month = 2,
+    export_volume_index = 3
+  ) %>%
+  fill(year, .direction = "down") %>%
+  filter(!is.na(month), !is.na(export_volume_index)) %>%
+  mutate(
+    year = as.integer(year),
+    month = as.integer(month),
+    export_volume_index = as.numeric(export_volume_index),
+    date = as.Date(paste(year, month, "01", sep = "-"))
+  ) %>%
+  arrange(date)
+
+head(export_general, 12)
+tail(export_general, 12)
+```
+
+# 6. Time Coverage and Forecast Target Period
+
+```{r time-coverage}
+first_period <- min(export_general$date)
+latest_period <- max(export_general$date)
+
+forecast_target_period <- seq(latest_period, by = "month", length.out = 2)[2]
+
+time_coverage <- paste0(format(first_period, "%Y-%m"), " / ", format(latest_period, "%Y-%m"))
+latest_available_observation <- format(latest_period, "%Y-%m")
+forecast_target <- format(forecast_target_period, "%Y-%m")
+
+time_coverage
+latest_available_observation
+forecast_target
+nrow(export_general)
+```
+
+The selected time series covers the period from **2013-01 to 2026-03** and contains **159 monthly observations**. The latest available TÜİK observation is **2026-03**, so the forecast target period is **2026-04**.
+
+# 7. Data Quality Checks
+
+```{r data-quality-checks}
+# Check missing monthly periods
+expected_dates <- seq(
+  from = min(export_general$date),
+  to = max(export_general$date),
+  by = "month"
+)
+
+missing_dates <- setdiff(expected_dates, export_general$date)
+
+length(missing_dates)
+missing_dates
+
+# Check duplicate periods
+export_general %>%
+  count(date) %>%
+  filter(n > 1)
+
+# Check missing values in the selected variable
+sum(is.na(export_general$export_volume_index))
+```
+
+The selected series has no missing monthly periods, no duplicate periods, and no missing values in the selected variable. Therefore, it is suitable for time series forecasting.
+
+# 8. Exploratory Time Series Analysis
+
+```{r actual-series-plot}
+actual_series_plot <- ggplot(export_general, aes(x = date, y = export_volume_index)) +
+  geom_line(linewidth = 0.8) +
+  labs(
+    title = "Monthly Export Volume Index — General",
+    x = "Date",
+    y = "Export Volume Index (2015=100)"
+  ) +
+  theme_minimal()
+
+actual_series_plot
+
+ggsave(
+  filename = "outputs/figures/actual_series_plot.png",
+  plot = actual_series_plot,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+```
+
+The selected time series represents Türkiye’s monthly general Export Volume Index based on 2015=100. The plot suggests that the export volume index has an upward long-term movement with visible monthly fluctuations. Since the data are monthly and contain repeated observations over time, trend and seasonality should be considered in the forecasting stage.
+
+# 9. Time Series Object
+
+```{r create-ts-object}
+start_year <- export_general$year[1]
+start_month <- export_general$month[1]
+
+export_ts <- ts(
+  export_general$export_volume_index,
+  start = c(start_year, start_month),
+  frequency = 12
+)
+
+export_ts
+```
+# 10. Forecast Accuracy Functions
+
+The following helper functions are used to calculate the required forecast accuracy and monitoring measures for each candidate forecasting method.
+
+```{r accuracy-functions}
+calculate_accuracy <- function(actual, forecast, method_name, next_forecast) {
+  valid_index <- !is.na(actual) & !is.na(forecast)
+  
+  actual_valid <- actual[valid_index]
+  forecast_valid <- forecast[valid_index]
+  
+  errors <- actual_valid - forecast_valid
+  
+  bias <- mean(errors)
+  mad <- mean(abs(errors))
+  mse <- mean(errors^2)
+  mape <- mean(abs(errors / actual_valid)) * 100
+  rsfe <- sum(errors)
+  tracking_signal <- ifelse(mad == 0, NA, rsfe / mad)
+  
+  tibble(
+    Method = method_name,
+    Bias = bias,
+    MAD = mad,
+    MSE = mse,
+    MAPE = mape,
+    RSFE = rsfe,
+    Tracking_Signal = tracking_signal,
+    Next_Period_Forecast = as.numeric(next_forecast)
+  )
+}
+
+plot_actual_vs_forecast <- function(data, forecast_column, title, file_name) {
+  plot_data <- data %>%
+    select(date, actual = export_volume_index, forecast = all_of(forecast_column)) %>%
+    pivot_longer(
+      cols = c(actual, forecast),
+      names_to = "Series",
+      values_to = "Value"
+    )
+  
+  p <- ggplot(plot_data, aes(x = date, y = Value, linetype = Series)) +
+    geom_line(linewidth = 0.8, na.rm = TRUE) +
+    labs(
+      title = title,
+      x = "Date",
+      y = "Export Volume Index (2015=100)",
+      linetype = "Series"
+    ) +
+    theme_minimal()
+  
+  print(p)
+  
+  ggsave(
+    filename = paste0("outputs/figures/", file_name),
+    plot = p,
+    width = 10,
+    height = 6,
+    dpi = 300
+  )
+}
+```
+# 11. Naïve Forecasting
+
+Naïve forecasting assumes that the forecast for the next period is equal to the most recent actual observation. This method is simple and useful as a baseline forecasting method.
+
+```{r naive-forecasting}
+naive_data <- export_general %>%
+  mutate(
+    naive_forecast = lag(export_volume_index)
+  )
+
+naive_next_forecast <- tail(export_general$export_volume_index, 1)
+
+naive_accuracy <- calculate_accuracy(
+  actual = naive_data$export_volume_index,
+  forecast = naive_data$naive_forecast,
+  method_name = "Naïve Forecasting",
+  next_forecast = naive_next_forecast
+)
+
+naive_accuracy
+```
+
+```{r naive-plot}
+plot_actual_vs_forecast(
+  data = naive_data,
+  forecast_column = "naive_forecast",
+  title = "Actual vs Naïve Forecast",
+  file_name = "naive_forecast_plot.png"
+)
+```
+
+The naïve forecasting method uses the previous month’s export volume index as the forecast for the current month. It provides a simple benchmark model. However, because it does not explicitly model trend or seasonality, it may perform poorly when the series has systematic monthly fluctuations or long-term movement.
+
+# 12. Moving Average
+
+A moving average forecast smooths short-term fluctuations by averaging the most recent observations. In this project, a 3-month moving average is used because the data are monthly and this window captures short-term movements without excessive smoothing.
+
+```{r moving-average}
+ma_window <- 3
+
+moving_average_data <- export_general %>%
+  mutate(
+    moving_average_forecast = zoo::rollmean(
+      export_volume_index,
+      k = ma_window,
+      align = "right",
+      fill = NA
+    )
+  ) %>%
+  mutate(
+    moving_average_forecast = lag(moving_average_forecast)
+  )
+
+moving_average_next_forecast <- mean(
+  tail(export_general$export_volume_index, ma_window),
+  na.rm = TRUE
+)
+
+moving_average_accuracy <- calculate_accuracy(
+  actual = moving_average_data$export_volume_index,
+  forecast = moving_average_data$moving_average_forecast,
+  method_name = "Moving Average",
+  next_forecast = moving_average_next_forecast
+)
+
+moving_average_accuracy
+```
+
+```{r moving-average-plot}
+plot_actual_vs_forecast(
+  data = moving_average_data,
+  forecast_column = "moving_average_forecast",
+  title = "Actual vs Moving Average Forecast",
+  file_name = "moving_average_plot.png"
+)
+```
+
+The 3-month moving average reduces short-term volatility by averaging the most recent three monthly observations. This method is useful for smoothing random variation, but it may lag behind the actual series when there is a strong trend or seasonal movement.
+
+# 13. Weighted Moving Average
+
+Weighted moving average gives different importance to recent observations. In this project, more weight is assigned to recent months because recent export movements are expected to be more informative for the next period.
+
+```{r weighted-moving-average}
+weights <- c(0.2, 0.3, 0.5)
+
+weighted_ma_values <- rep(NA, nrow(export_general))
+
+for (i in 4:nrow(export_general)) {
+  previous_values <- export_general$export_volume_index[(i - 3):(i - 1)]
+  weighted_ma_values[i] <- sum(previous_values * weights)
+}
+
+weighted_ma_data <- export_general %>%
+  mutate(
+    weighted_moving_average_forecast = weighted_ma_values
+  )
+
+weighted_ma_next_forecast <- sum(
+  tail(export_general$export_volume_index, 3) * weights
+)
+
+weighted_ma_accuracy <- calculate_accuracy(
+  actual = weighted_ma_data$export_volume_index,
+  forecast = weighted_ma_data$weighted_moving_average_forecast,
+  method_name = "Weighted Moving Average",
+  next_forecast = weighted_ma_next_forecast
+)
+
+weighted_ma_accuracy
+```
+
+```{r weighted-moving-average-plot}
+plot_actual_vs_forecast(
+  data = weighted_ma_data,
+  forecast_column = "weighted_moving_average_forecast",
+  title = "Actual vs Weighted Moving Average Forecast",
+  file_name = "weighted_moving_average_plot.png"
+)
+```
+
+The selected weights are 0.2, 0.3, and 0.5, with the highest weight given to the most recent month. This weighting logic is reasonable because recent export volume movements may better reflect current trade conditions.
+
+# 14. Exponential Smoothing
+
+Simple exponential smoothing gives more importance to recent observations while still using the full historical series. It is suitable as a baseline smoothing method, especially when the series does not require an explicit trend or seasonal structure.
+
+```{r exponential-smoothing}
+ses_model <- forecast::ses(export_ts, h = 1)
+
+ses_fitted <- as.numeric(fitted(ses_model))
+
+exponential_smoothing_data <- export_general %>%
+  mutate(
+    exponential_smoothing_forecast = ses_fitted
+  )
+
+exponential_smoothing_next_forecast <- as.numeric(ses_model$mean[1])
+
+exponential_smoothing_accuracy <- calculate_accuracy(
+  actual = exponential_smoothing_data$export_volume_index,
+  forecast = exponential_smoothing_data$exponential_smoothing_forecast,
+  method_name = "Exponential Smoothing",
+  next_forecast = exponential_smoothing_next_forecast
+)
+
+ses_model
+exponential_smoothing_accuracy
+```
+
+```{r exponential-smoothing-plot}
+plot_actual_vs_forecast(
+  data = exponential_smoothing_data,
+  forecast_column = "exponential_smoothing_forecast",
+  title = "Actual vs Exponential Smoothing Forecast",
+  file_name = "exponential_smoothing_plot.png"
+)
+```
+
+The exponential smoothing method automatically estimates the smoothing parameter. This method is useful for smoothing the series, but it may not fully capture trend and seasonality if these components are important in the export volume index.
+
+# 15. Trend-Adjusted Exponential Smoothing
+
+Trend-adjusted exponential smoothing is used when a time series shows a meaningful trend. Since the export volume index shows a long-term upward movement, a Holt trend method is applied.
+
+```{r trend-adjusted-exponential-smoothing}
+holt_model <- forecast::holt(export_ts, h = 1)
+
+holt_fitted <- as.numeric(fitted(holt_model))
+
+trend_adjusted_data <- export_general %>%
+  mutate(
+    trend_adjusted_forecast = holt_fitted
+  )
+
+trend_adjusted_next_forecast <- as.numeric(holt_model$mean[1])
+
+trend_adjusted_accuracy <- calculate_accuracy(
+  actual = trend_adjusted_data$export_volume_index,
+  forecast = trend_adjusted_data$trend_adjusted_forecast,
+  method_name = "Trend-Adjusted Exponential Smoothing",
+  next_forecast = trend_adjusted_next_forecast
+)
+
+holt_model
+trend_adjusted_accuracy
+```
+
+```{r trend-adjusted-plot}
+plot_actual_vs_forecast(
+  data = trend_adjusted_data,
+  forecast_column = "trend_adjusted_forecast",
+  title = "Actual vs Trend-Adjusted Exponential Smoothing Forecast",
+  file_name = "trend_adjusted_smoothing_plot.png"
+)
+```
+
+Trend-adjusted exponential smoothing is appropriate because the series shows a visible long-term movement. This method extends simple exponential smoothing by adding a trend component, so it can react better to upward or downward movement in the series.
+
+# 16. Linear Trend Projection
+
+Linear trend projection estimates a regression model using time as the explanatory variable. The model captures the average long-term direction of the export volume index.
+
+```{r linear-trend-projection}
+trend_data <- export_general %>%
+  mutate(
+    time_index = row_number()
+  )
+
+linear_trend_model <- lm(export_volume_index ~ time_index, data = trend_data)
+
+trend_data <- trend_data %>%
+  mutate(
+    linear_trend_forecast = as.numeric(predict(linear_trend_model, newdata = trend_data))
+  )
+
+next_time_index <- max(trend_data$time_index) + 1
+
+linear_trend_next_forecast <- predict(
+  linear_trend_model,
+  newdata = tibble(time_index = next_time_index)
+)
+
+linear_trend_accuracy <- calculate_accuracy(
+  actual = trend_data$export_volume_index,
+  forecast = trend_data$linear_trend_forecast,
+  method_name = "Linear Trend Projection",
+  next_forecast = linear_trend_next_forecast
+)
+
+summary(linear_trend_model)
+linear_trend_accuracy
+```
+
+```{r linear-trend-plot}
+plot_actual_vs_forecast(
+  data = trend_data,
+  forecast_column = "linear_trend_forecast",
+  title = "Actual vs Linear Trend Projection",
+  file_name = "trend_projection_plot.png"
+)
+```
+
+The estimated intercept represents the predicted export volume index at the beginning of the time scale, while the slope represents the average monthly change in the export volume index. A positive slope indicates an upward long-term trend.
+
+# 17. Seasonal Indices
+
+Since the data are monthly, seasonal indices can be calculated to identify recurring monthly patterns. The seasonal index shows whether a particular month tends to be above or below the overall average level.
+
+```{r seasonal-indices}
+seasonal_index_table <- export_general %>%
+  mutate(month_name = month.abb[month]) %>%
+  group_by(month, month_name) %>%
+  summarise(
+    monthly_average = mean(export_volume_index, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    overall_average = mean(export_general$export_volume_index, na.rm = TRUE),
+    seasonal_index = monthly_average / overall_average
+  ) %>%
+  arrange(month)
+
+seasonal_index_table
+
+seasonal_indices_data <- export_general %>%
+  left_join(seasonal_index_table %>% select(month, seasonal_index), by = "month") %>%
+  mutate(
+    deseasonalized_value = export_volume_index / seasonal_index
+  )
+
+# Trend model on deseasonalized values
+seasonal_trend_data <- seasonal_indices_data %>%
+  mutate(time_index = row_number())
+
+seasonal_trend_model <- lm(deseasonalized_value ~ time_index, data = seasonal_trend_data)
+
+seasonal_indices_forecast_data <- seasonal_trend_data %>%
+  mutate(
+    deseasonalized_forecast = as.numeric(predict(seasonal_trend_model, newdata = seasonal_trend_data)),
+    seasonal_indices_forecast = deseasonalized_forecast * seasonal_index
+  )
+
+next_month <- as.integer(format(forecast_target_period, "%m"))
+next_seasonal_index <- seasonal_index_table %>%
+  filter(month == next_month) %>%
+  pull(seasonal_index)
+
+next_deseasonalized_forecast <- predict(
+  seasonal_trend_model,
+  newdata = tibble(time_index = max(seasonal_trend_data$time_index) + 1)
+)
+
+seasonal_indices_next_forecast <- as.numeric(next_deseasonalized_forecast * next_seasonal_index)
+
+seasonal_indices_accuracy <- calculate_accuracy(
+  actual = seasonal_indices_forecast_data$export_volume_index,
+  forecast = seasonal_indices_forecast_data$seasonal_indices_forecast,
+  method_name = "Seasonal Indices",
+  next_forecast = seasonal_indices_next_forecast
+)
+
+seasonal_indices_accuracy
+```
+
+```{r seasonal-indices-plot}
+plot_actual_vs_forecast(
+  data = seasonal_indices_forecast_data,
+  forecast_column = "seasonal_indices_forecast",
+  title = "Actual vs Seasonal Indices Forecast",
+  file_name = "seasonal_indices_plot.png"
+)
+```
+
+The seasonal indices show which months are typically above or below the overall average export volume index. This method is useful because the selected data are monthly and may contain recurring seasonal patterns.
+
+# 18. Additive Decomposition
+
+Additive decomposition separates the series into trend, seasonal, and random components. It is suitable when seasonal fluctuations are relatively stable in size over time.
+
+```{r additive-decomposition}
+additive_decomp <- decompose(export_ts, type = "additive")
+
+plot(additive_decomp)
+
+additive_adjusted <- seasadj(additive_decomp)
+
+additive_trend_model <- tslm(additive_adjusted ~ trend)
+
+additive_forecast_adjusted <- forecast(additive_trend_model, h = 1)
+
+additive_fitted_adjusted <- as.numeric(fitted(additive_trend_model))
+
+additive_seasonal_component <- as.numeric(additive_decomp$seasonal)
+
+additive_fitted_full <- additive_fitted_adjusted + additive_seasonal_component
+
+additive_data <- export_general %>%
+  mutate(
+    additive_decomposition_forecast = additive_fitted_full
+  )
+
+# Seasonal component for the next month
+next_month_position <- cycle(ts(rep(NA, length(export_ts) + 1), start = start(export_ts), frequency = 12))[length(export_ts) + 1]
+next_additive_seasonal <- tapply(additive_seasonal_component, cycle(export_ts), mean, na.rm = TRUE)[next_month_position]
+
+additive_next_forecast <- as.numeric(additive_forecast_adjusted$mean[1] + next_additive_seasonal)
+
+additive_accuracy <- calculate_accuracy(
+  actual = additive_data$export_volume_index,
+  forecast = additive_data$additive_decomposition_forecast,
+  method_name = "Additive Decomposition",
+  next_forecast = additive_next_forecast
+)
+
+additive_accuracy
+```
+
+```{r additive-decomposition-plot}
+plot_actual_vs_forecast(
+  data = additive_data,
+  forecast_column = "additive_decomposition_forecast",
+  title = "Actual vs Additive Decomposition Forecast",
+  file_name = "additive_decomposition_plot.png"
+)
+```
+
+Additive decomposition separates the export volume index into trend, seasonal, and residual components. This method is useful when the size of seasonal movements is relatively constant over time.
+
+# 19. Multiplicative Decomposition
+
+Multiplicative decomposition separates the series into trend, seasonal, and random components using a multiplicative structure. Since the export volume index values are positive, this method is applicable.
+
+```{r multiplicative-decomposition}
+multiplicative_decomp <- decompose(export_ts, type = "multiplicative")
+
+plot(multiplicative_decomp)
+
+multiplicative_adjusted <- seasadj(multiplicative_decomp)
+
+multiplicative_trend_model <- tslm(multiplicative_adjusted ~ trend)
+
+multiplicative_forecast_adjusted <- forecast(multiplicative_trend_model, h = 1)
+
+multiplicative_fitted_adjusted <- as.numeric(fitted(multiplicative_trend_model))
+
+multiplicative_seasonal_component <- as.numeric(multiplicative_decomp$seasonal)
+
+multiplicative_fitted_full <- multiplicative_fitted_adjusted * multiplicative_seasonal_component
+
+multiplicative_data <- export_general %>%
+  mutate(
+    multiplicative_decomposition_forecast = multiplicative_fitted_full
+  )
+
+# Seasonal component for the next month
+next_month_position <- cycle(ts(rep(NA, length(export_ts) + 1), start = start(export_ts), frequency = 12))[length(export_ts) + 1]
+next_multiplicative_seasonal <- tapply(multiplicative_seasonal_component, cycle(export_ts), mean, na.rm = TRUE)[next_month_position]
+
+multiplicative_next_forecast <- as.numeric(multiplicative_forecast_adjusted$mean[1] * next_multiplicative_seasonal)
+
+multiplicative_accuracy <- calculate_accuracy(
+  actual = multiplicative_data$export_volume_index,
+  forecast = multiplicative_data$multiplicative_decomposition_forecast,
+  method_name = "Multiplicative Decomposition",
+  next_forecast = multiplicative_next_forecast
+)
+
+multiplicative_accuracy
+```
+
+```{r multiplicative-decomposition-plot}
+plot_actual_vs_forecast(
+  data = multiplicative_data,
+  forecast_column = "multiplicative_decomposition_forecast",
+  title = "Actual vs Multiplicative Decomposition Forecast",
+  file_name = "multiplicative_decomposition_plot.png"
+)
+```
+
+Multiplicative decomposition is appropriate when seasonal fluctuations change proportionally with the level of the series. Since the export volume index is positive throughout the observed period, this method can be applied.
+
+# 20. Regression with Trend and Seasonal Dummy Variables
+
+This model uses both a time trend and monthly seasonal dummy variables. Since the selected data are monthly, seasonal dummy variables are appropriate.
+
+```{r regression-seasonal-dummies}
+regression_data <- export_general %>%
+  mutate(
+    time_index = row_number(),
+    month_factor = factor(month)
+  )
+
+seasonal_dummy_model <- lm(
+  export_volume_index ~ time_index + month_factor,
+  data = regression_data
+)
+
+regression_data <- regression_data %>%
+  mutate(
+    regression_seasonal_dummy_forecast = as.numeric(
+      predict(seasonal_dummy_model, newdata = regression_data)
+    )
+  )
+
+next_regression_data <- tibble(
+  time_index = max(regression_data$time_index) + 1,
+  month_factor = factor(
+    as.integer(format(forecast_target_period, "%m")),
+    levels = levels(regression_data$month_factor)
+  )
+)
+
+regression_next_forecast <- predict(
+  seasonal_dummy_model,
+  newdata = next_regression_data
+)
+
+regression_accuracy <- calculate_accuracy(
+  actual = regression_data$export_volume_index,
+  forecast = regression_data$regression_seasonal_dummy_forecast,
+  method_name = "Regression with Trend and Seasonal Dummies",
+  next_forecast = regression_next_forecast
+)
+
+summary(seasonal_dummy_model)
+regression_accuracy
+```
+
+```{r regression-seasonal-dummy-plot}
+plot_actual_vs_forecast(
+  data = regression_data,
+  forecast_column = "regression_seasonal_dummy_forecast",
+  title = "Actual vs Regression with Trend and Seasonal Dummy Variables",
+  file_name = "regression_seasonal_dummy_plot.png"
+)
+```
+
+The regression model includes a time trend variable and monthly seasonal dummy variables. The trend coefficient shows the average monthly change in the export volume index after controlling for seasonal effects. The monthly dummy coefficients show how each month differs from the reference month.
+
+# 21. Forecast Accuracy Comparison
+
+The following table compares all candidate forecasting methods using the required accuracy and monitoring measures: Bias, MAD, MSE, MAPE, RSFE, Tracking Signal, and the next-period forecast.
+
+```{r accuracy-comparison}
+accuracy_comparison <- bind_rows(
+  naive_accuracy,
+  moving_average_accuracy,
+  weighted_ma_accuracy,
+  exponential_smoothing_accuracy,
+  trend_adjusted_accuracy,
+  linear_trend_accuracy,
+  seasonal_indices_accuracy,
+  additive_accuracy,
+  multiplicative_accuracy,
+  regression_accuracy
+) %>%
+  mutate(
+    across(
+      c(Bias, MAD, MSE, MAPE, RSFE, Tracking_Signal, Next_Period_Forecast),
+      ~ round(.x, 3)
+    )
+  ) %>%
+  arrange(MAPE)
+
+accuracy_comparison %>%
+  print(width = Inf)
+
+write.csv(
+  accuracy_comparison,
+  "outputs/tables/accuracy_comparison.csv",
+  row.names = FALSE
+)
+```
+
+The comparison table is sorted by MAPE. However, the final method selection is not based only on the lowest error value. The suitability of each method for the time series structure is also considered.
+
+# 22. Superior Method Selection
+
+The superior method is selected by considering both forecast accuracy and suitability for the structure of the selected time series.
+
+```{r superior-method-selection}
+superior_method <- accuracy_comparison %>%
+  slice_min(order_by = MAPE, n = 1)
+
+superior_method
+```
+
+The selected superior method has the lowest MAPE among the candidate methods. In addition, the method is evaluated according to whether it can reasonably capture the observed structure of the monthly export volume index, including trend and seasonal movements.
+
+# 23. Final Next-Period Forecast
+
+The final forecast is produced for the next period after the latest available TÜİK observation.
+
+```{r final-forecast-table}
+final_forecast <- tibble(
+  Selected_Superior_Method = superior_method$Method,
+  Data_Access_Date = Sys.Date(),
+  Latest_Available_Observation = latest_available_observation,
+  Forecast_Target_Period = forecast_target,
+  Forecasted_Value = superior_method$Next_Period_Forecast,
+  Bias = superior_method$Bias,
+  MAD = superior_method$MAD,
+  MSE = superior_method$MSE,
+  MAPE = superior_method$MAPE,
+  RSFE = superior_method$RSFE,
+  Tracking_Signal = superior_method$Tracking_Signal
+)
+
+final_forecast %>%
+  print(width = Inf)
+
+write.csv(
+  final_forecast,
+  "outputs/tables/final_forecast.csv",
+  row.names = FALSE
+)
+```
+
+The selected model forecasts the Export Volume Index — General for the target period immediately following the latest available observation. Since the latest available observation is 2026-03, the forecast target period is 2026-04.
+
+# 24. Superior Method Plot
+
+The following plot shows the actual series together with the forecast values of the selected superior method.
+
+```{r superior-method-plot}
+superior_method_name <- superior_method$Method[1]
+
+if (superior_method_name == "Naïve Forecasting") {
+  superior_plot_data <- naive_data %>%
+    select(date, actual = export_volume_index, forecast = naive_forecast)
+} else if (superior_method_name == "Moving Average") {
+  superior_plot_data <- moving_average_data %>%
+    select(date, actual = export_volume_index, forecast = moving_average_forecast)
+} else if (superior_method_name == "Weighted Moving Average") {
+  superior_plot_data <- weighted_ma_data %>%
+    select(date, actual = export_volume_index, forecast = weighted_moving_average_forecast)
+} else if (superior_method_name == "Exponential Smoothing") {
+  superior_plot_data <- exponential_smoothing_data %>%
+    select(date, actual = export_volume_index, forecast = exponential_smoothing_forecast)
+} else if (superior_method_name == "Trend-Adjusted Exponential Smoothing") {
+  superior_plot_data <- trend_adjusted_data %>%
+    select(date, actual = export_volume_index, forecast = trend_adjusted_forecast)
+} else if (superior_method_name == "Linear Trend Projection") {
+  superior_plot_data <- trend_data %>%
+    select(date, actual = export_volume_index, forecast = linear_trend_forecast)
+} else if (superior_method_name == "Seasonal Indices") {
+  superior_plot_data <- seasonal_indices_forecast_data %>%
+    select(date, actual = export_volume_index, forecast = seasonal_indices_forecast)
+} else if (superior_method_name == "Additive Decomposition") {
+  superior_plot_data <- additive_data %>%
+    select(date, actual = export_volume_index, forecast = additive_decomposition_forecast)
+} else if (superior_method_name == "Multiplicative Decomposition") {
+  superior_plot_data <- multiplicative_data %>%
+    select(date, actual = export_volume_index, forecast = multiplicative_decomposition_forecast)
+} else if (superior_method_name == "Regression with Trend and Seasonal Dummies") {
+  superior_plot_data <- regression_data %>%
+    select(date, actual = export_volume_index, forecast = regression_seasonal_dummy_forecast)
+}
+
+superior_plot_long <- superior_plot_data %>%
+  pivot_longer(
+    cols = c(actual, forecast),
+    names_to = "Series",
+    values_to = "Value"
+  )
+
+superior_method_plot <- ggplot(superior_plot_long, aes(x = date, y = Value, linetype = Series)) +
+  geom_line(linewidth = 0.8, na.rm = TRUE) +
+  geom_point(
+    data = tibble(
+      date = forecast_target_period,
+      Value = superior_method$Next_Period_Forecast,
+      Series = "next_period_forecast"
+    ),
+    aes(x = date, y = Value),
+    size = 3,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title = paste("Superior Method Forecast:", superior_method_name),
+    x = "Date",
+    y = "Export Volume Index (2015=100)",
+    linetype = "Series"
+  ) +
+  theme_minimal()
+
+superior_method_plot
+
+ggsave(
+  filename = "outputs/figures/superior_method_plot.png",
+  plot = superior_method_plot,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+```
+
+# 25. Limitations
+
+This forecasting study has several limitations. First, the analysis uses only historical values of the export volume index and does not include external explanatory variables such as exchange rates, global demand, energy prices, geopolitical shocks, or trade policy changes. Second, the series may be affected by structural breaks and extraordinary economic events. Third, TÜİK data may be revised over time, which can affect future reproducibility. Finally, the selected methods are classical quantitative forecasting methods, so they may not fully capture complex nonlinear patterns.
+
+# 26. Reproducibility Notes
+
+The analysis is fully reproducible from the R Markdown notebook. The TÜİK table is identified through `tuikr::statistical_tables()`, and the data are retrieved programmatically in R using `httr::GET()`. No local manually downloaded data file is required.
+
+The main output files generated by this notebook are:
+
+- `outputs/tables/accuracy_comparison.csv`
+- `outputs/tables/final_forecast.csv`
+- `outputs/figures/actual_series_plot.png`
+- Actual vs forecast plots for all candidate methods
+- `outputs/figures/superior_method_plot.png`

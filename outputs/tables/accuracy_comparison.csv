@@ -1,0 +1,11 @@
+"Method","Bias","MAD","MSE","MAPE","RSFE","Tracking_Signal","Next_Period_Forecast"
+"Multiplicative Decomposition",-0.012,8.39,131.574,6.877,-1.964,-0.234,154.753
+"Seasonal Indices",-0.044,8.479,130.184,6.997,-6.992,-0.825,153.189
+"Additive Decomposition",0,8.583,132.414,7.09,0,0,155.185
+"Regression with Trend and Seasonal Dummies",0,8.594,131.498,7.104,0,0,156.372
+"Trend-Adjusted Exponential Smoothing",-0.026,10.134,164.515,8.313,-4.055,-0.4,143.511
+"Linear Trend Projection",0,10.292,176.344,8.399,0,0,159.763
+"Exponential Smoothing",1.459,10.434,167.199,8.477,231.942,22.23,140.011
+"Weighted Moving Average",0.414,11.042,193.171,9.025,64.621,5.852,130.276
+"Moving Average",0.492,11.249,191.163,9.214,76.794,6.827,128.974
+"Naïve Forecasting",0.317,13.024,270.757,10.68,50.038,3.842,133.337
