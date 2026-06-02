@@ -1,4 +1,4 @@
-# TÜİK Forecasting Project
+# TUIK Forecasting Project
 
 ## 1. Project Overview
 
@@ -6,7 +6,7 @@ This project develops an R-based forecasting analysis using a time series data s
 
 The main objective is to forecast the next available monthly period after the latest TÜİK observation by applying and comparing several quantitative forecasting methods.
 
-## 2. Data Source and TÜİK Connection
+## 2. Data Source and TUIK Connection
 
 The data were accessed directly in R. First, the relevant TÜİK table was identified using the `tuikr` package through `tuikr::statistical_tables()`. Since direct access through `statistical_data()` returned an authorization error, the table URL obtained through `tuikr::statistical_tables()` was accessed programmatically in R using `httr::GET()`.
 
@@ -33,11 +33,11 @@ The selected variable is suitable for forecasting because it is a monthly time s
 
 ## 4. Use of TÜİK Data in R
 
-The TÜİK data were used directly in R. The raw table was accessed programmatically and then cleaned within the R Markdown notebook.
+The TUIK data were used directly in R. The raw table was accessed programmatically and then cleaned within the R Markdown notebook.
 
 The following R-based adjustments were made:
 
-- The relevant TÜİK theme was selected as International Trade.
+- The relevant TUIK theme was selected as International Trade.
 - The monthly volume indices table was identified through `tuikr::statistical_tables()`.
 - The selected variable was filtered as Export Volume Index — General.
 - The year variable was filled downward because the original TÜİK table reports the year once and leaves following monthly rows blank.
